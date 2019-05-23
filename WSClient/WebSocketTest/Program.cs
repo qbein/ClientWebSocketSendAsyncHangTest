@@ -17,23 +17,28 @@ namespace WebSocketTest
 
         private static Dictionary<int, ClientWebSocket> _sockets;
 
+        const string SERVER_URL = "ws://localhost:1337";
+        const string PROTOCOL = "zap-test";
+        const int MESSAGE_INTERVAL_MS = 2000;
+
+        private static ClientWebSocket CreateSocket()
+        {
+            var socket = new ClientWebSocket();
+            socket.Options.AddSubProtocol(PROTOCOL);
+            // Aggressive keep alive to trigger issue faster!
+            socket.Options.KeepAliveInterval = TimeSpan.FromMilliseconds(1);
+            return socket;
+        }
+
         static async Task MainAsync(string[] args)
         {
-            const string SERVER_URL = "ws://localhost:1337";
-            const string PROTOCOL = "zap-test";
-            const int MESSAGE_INTERVAL_MS = 2000;
             var mitigationInterval = TimeSpan.FromSeconds(10);
 
             _sockets = new Dictionary<int, ClientWebSocket>();
 
             for (var i=0; i<2; i++)
             {
-                var socket = new ClientWebSocket();
-                _sockets.Add(i, socket);
-
-                socket.Options.AddSubProtocol(PROTOCOL);
-                // Aggressive keep alive to trigger issue faster!
-                socket.Options.KeepAliveInterval = TimeSpan.FromMilliseconds(1); 
+                _sockets.Add(i, CreateSocket());
             }
 
             await Task.WhenAll(_sockets.Select(kvp =>
@@ -63,7 +68,13 @@ namespace WebSocketTest
                             var sendDuration = DateTime.UtcNow - sendStarted.Value;
                             if (sendDuration > mitigationInterval)
                             {
-                                Console.WriteLine($"SOCKET {key} SendAsync stuck for {Math.Floor(sendDuration.TotalSeconds)}s");
+                                Console.WriteLine($"SOCKET {key} @@@@@@@@@@@@@@@@ SendAsync stuck for {Math.Floor(sendDuration.TotalSeconds)}s");
+
+                                socket.Dispose();
+
+                                socket = CreateSocket();
+                                await socket.ConnectAsync(new Uri(SERVER_URL), CancellationToken.None);
+                                _sockets[key] = socket;
                             }
                         }
                         await Task.Delay(mitigationInterval);
@@ -75,25 +86,36 @@ namespace WebSocketTest
                 {
                     while (true)
                     {
-                        using (var cancellationTokenSource = new CancellationTokenSource(mitigationInterval))
+                        try
                         {
-                            var message = $"SOCKET {key} {Guid.NewGuid().ToString()}";
-                            var bytes = new ArraySegment<byte>(Encoding.UTF8.GetBytes(message));
-                            sendStarted = DateTime.UtcNow;
+                            using (var cancellationTokenSource = new CancellationTokenSource(mitigationInterval))
+                            {
+                                var message = $"SOCKET {key} {Guid.NewGuid().ToString()}";
+                                var bytes = new ArraySegment<byte>(Encoding.UTF8.GetBytes(message));
+                                sendStarted = DateTime.UtcNow;
 
-                            Console.WriteLine($"SOCKET {key} Sending socket: {message}");
-                            await socket.SendAsync(bytes, WebSocketMessageType.Text, true, cancellationTokenSource.Token);
-                            Console.WriteLine($"SOCKET {key} Send complete");
+                                Console.WriteLine($"SOCKET {key} Sending socket: {message}");
+                                await _sockets[key].SendAsync(bytes, WebSocketMessageType.Text, true, cancellationTokenSource.Token);
+                                Console.WriteLine($"SOCKET {key} Send complete");
 
-                            sendStarted = null;
+                                sendStarted = null;
+                            }
+
+                            var buffer = new ArraySegment<byte>(new byte[65536]);
+                            var result = await _sockets[key].ReceiveAsync(buffer, CancellationToken.None);
+
+                            Console.WriteLine($"SOCKET {key} Received: {Encoding.UTF8.GetString(buffer.Array, 0, result.Count)}");
+
+                            await Task.Delay(MESSAGE_INTERVAL_MS);
                         }
-
-                        var buffer = new ArraySegment<byte>(new byte[65536]);
-                        var result = await socket.ReceiveAsync(buffer, CancellationToken.None);
-
-                        Console.WriteLine($"SOCKET {key} Received: {Encoding.UTF8.GetString(buffer.Array, 0, result.Count)}");
-
-                        await Task.Delay(MESSAGE_INTERVAL_MS);
+                        catch (ObjectDisposedException)
+                        {
+                            Console.WriteLine($"SOCKET {key} Socket disposed..");
+                        }
+                        catch (Exception e)
+                        {
+                            Console.WriteLine($"SOCKET {key} ############################################ " + e.Message);
+                        }
                     }
                 });
 #pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
